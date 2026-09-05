@@ -38,6 +38,7 @@ import pygame
 import sys
 import math
 import array
+import os
 
 # ------------------------------------------------------------------
 # STEP 1: Settings (yeh values apni zarurat ke hisaab se badal sakte ho)
@@ -53,10 +54,13 @@ ROAD_RIGHT = SCREEN_WIDTH - 80  # road ki right boundary (x position)
 CAR_WIDTH = 48
 CAR_HEIGHT = 86
 
-TILT_SENSITIVITY = 6.0    # jitna zyada, utna tilt se car utni tezi se move hogi
+TILT_SENSITIVITY = 15.0   # Fast and responsive car steering
 MAX_TILT_ANGLE = 30.0     # is se zyada tilt ko ignore/clip kar denge (safety)
 
 FPS = 60
+
+# Highscore persistent storage file
+HIGHSCORE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "highscore.txt")
 
 # Level Progression Milestones:
 # Score 50 -> Level 2, 100 -> Level 3, 150 -> Level 4, 250 -> Level 5, 400 -> Level 6, etc.
@@ -111,6 +115,7 @@ COLOR_COIN = (255, 215, 0)          # Gold
 COLOR_COIN_BORDER = (218, 165, 32)   # Dark goldenrod
 COLOR_COIN_INNER = (255, 248, 180)   # Shiny highlight
 COLOR_LEVEL = (56, 225, 255)        # Electric Cyan
+COLOR_HIGHSCORE = (255, 195, 45)     # Warm Trophy Gold
 
 
 # ------------------------------------------------------------------
@@ -156,7 +161,6 @@ def udp_listener_thread():
             angle = float(text)
             tilt_data.update(angle)
         except (ValueError, UnicodeDecodeError):
-            # Agar galat/corrupt data aaya to usko ignore kar do, crash mat karo
             continue
         except OSError:
             break
@@ -612,7 +616,25 @@ class CarRacingGame:
         self.font_tiny = pygame.font.SysFont("arial", 13)
 
         self.sound_mgr = SoundManager()
+        self.highscore = self.load_highscore()
+        self.is_new_highscore = False
         self.reset()
+
+    def load_highscore(self):
+        try:
+            if os.path.exists(HIGHSCORE_FILE):
+                with open(HIGHSCORE_FILE, "r") as f:
+                    return int(f.read().strip())
+        except Exception:
+            pass
+        return 0
+
+    def save_highscore(self):
+        try:
+            with open(HIGHSCORE_FILE, "w") as f:
+                f.write(str(int(self.highscore)))
+        except Exception:
+            pass
 
     def reset(self):
         self.player = PlayerCar()
@@ -626,6 +648,7 @@ class CarRacingGame:
         self.coins_collected = 0
         self.level = 1
         self.level_up_timer = 0.0
+        self.is_new_highscore = False
 
         self.enemy_speed = 270.0        # pixels per second
         self.spawn_timer = 0.0
@@ -670,7 +693,6 @@ class CarRacingGame:
         self.elapsed += dt
 
         # ---------- Level Upgradation System (Distance Milestone Curve) ----------
-        # Score 50 -> Lvl 2, 100 -> Lvl 3, 150 -> Lvl 4, 250 -> Lvl 5, 400 -> Lvl 6, etc.
         new_level = get_level_for_score(self.score)
         if new_level > self.level:
             self.level = new_level
@@ -760,6 +782,13 @@ class CarRacingGame:
             if player_rect.colliderect(enemy.get_rect()):
                 self.game_over = True
                 self.sound_mgr.play_crash()
+                # Check and save high score
+                final_int_score = int(self.score)
+                if final_int_score > self.highscore:
+                    self.highscore = final_int_score
+                    self.is_new_highscore = True
+                    self.save_highscore()
+
                 # Crash particles
                 for _ in range(40):
                     vx = random.uniform(-140, 140)
@@ -787,16 +816,22 @@ class CarRacingGame:
         self.screen.blit(score_label, (24, 16))
         self.screen.blit(score_val, (24, 34))
 
-        # Coins Counter (Top Center)
-        coin_icon_rect = pygame.Rect(180, 28, 18, 18)
+        # High Score / Best (Top Center-Left)
+        best_label = self.font_tiny.render("BEST", True, COLOR_TEXT_DIM)
+        best_val = self.font_medium.render(f"{self.highscore}", True, COLOR_HIGHSCORE)
+        self.screen.blit(best_label, (120, 16))
+        self.screen.blit(best_val, (120, 34))
+
+        # Coins Counter (Top Center-Right)
+        coin_icon_rect = pygame.Rect(225, 28, 18, 18)
         pygame.draw.circle(self.screen, COLOR_COIN_BORDER, coin_icon_rect.center, 9)
         pygame.draw.circle(self.screen, COLOR_COIN, coin_icon_rect.center, 7)
         pygame.draw.circle(self.screen, COLOR_COIN_INNER, (coin_icon_rect.centerx - 2, coin_icon_rect.centery - 2), 3)
 
         coins_label = self.font_tiny.render("COINS", True, COLOR_TEXT_DIM)
         coins_val = self.font_medium.render(f"{self.coins_collected}", True, COLOR_COIN)
-        self.screen.blit(coins_label, (206, 16))
-        self.screen.blit(coins_val, (206, 34))
+        self.screen.blit(coins_label, (250, 16))
+        self.screen.blit(coins_val, (250, 34))
 
         # Level Badge (Top Right)
         level_label = self.font_tiny.render("LEVEL", True, COLOR_TEXT_DIM)
@@ -843,34 +878,45 @@ class CarRacingGame:
 
     def draw_game_over(self):
         overlay = pygame.Surface((SCREEN_WIDTH, SCREEN_HEIGHT), pygame.SRCALPHA)
-        overlay.fill((10, 12, 16, 200))
+        overlay.fill((10, 12, 16, 205))
         self.screen.blit(overlay, (0, 0))
 
         # Glass Panel Card
-        card_w, card_h = 360, 260
+        card_w, card_h = 370, 290
         card_rect = pygame.Rect((SCREEN_WIDTH - card_w) / 2, (SCREEN_HEIGHT - card_h) / 2 - 20, card_w, card_h)
         card_s = pygame.Surface((card_w, card_h), pygame.SRCALPHA)
         pygame.draw.rect(card_s, (22, 26, 34, 245), (0, 0, card_w, card_h), border_radius=16)
-        pygame.draw.rect(card_s, (255, 75, 75, 160), (0, 0, card_w, card_h), width=2, border_radius=16)
+        border_col = COLOR_HIGHSCORE if self.is_new_highscore else (255, 75, 75, 160)
+        pygame.draw.rect(card_s, border_col, (0, 0, card_w, card_h), width=2, border_radius=16)
         self.screen.blit(card_s, card_rect.topleft)
 
-        title = self.font_large.render("GAME OVER", True, (255, 75, 75))
-        title_rect = title.get_rect(center=(SCREEN_WIDTH / 2, card_rect.y + 40))
-        self.screen.blit(title, title_rect)
+        # Title / Record Banner
+        if self.is_new_highscore:
+            title = self.font_medium.render("★ NEW RECORD! ★", True, COLOR_HIGHSCORE)
+            title_rect = title.get_rect(center=(SCREEN_WIDTH / 2, card_rect.y + 30))
+            self.screen.blit(title, title_rect)
+            go_title = self.font_large.render("GAME OVER", True, (255, 90, 90))
+            go_rect = go_title.get_rect(center=(SCREEN_WIDTH / 2, card_rect.y + 68))
+            self.screen.blit(go_title, go_rect)
+        else:
+            title = self.font_large.render("GAME OVER", True, (255, 75, 75))
+            title_rect = title.get_rect(center=(SCREEN_WIDTH / 2, card_rect.y + 45))
+            self.screen.blit(title, title_rect)
 
-        score_surf = self.font_medium.render(f"Final Score: {int(self.score)}", True, COLOR_TEXT)
-        score_rect = score_surf.get_rect(center=(SCREEN_WIDTH / 2, card_rect.y + 95))
+        # Scores
+        score_surf = self.font_medium.render(f"Score: {int(self.score)}   |   Best: {self.highscore}", True, COLOR_TEXT)
+        score_rect = score_surf.get_rect(center=(SCREEN_WIDTH / 2, card_rect.y + 115))
         self.screen.blit(score_surf, score_rect)
 
-        stats_surf = self.font_small.render(f"Level Reached: {self.level}   |   Coins: {self.coins_collected}", True, COLOR_COIN)
-        stats_rect = stats_surf.get_rect(center=(SCREEN_WIDTH / 2, card_rect.y + 135))
+        stats_surf = self.font_small.render(f"Level: {self.level}   •   Coins: {self.coins_collected}", True, COLOR_COIN)
+        stats_rect = stats_surf.get_rect(center=(SCREEN_WIDTH / 2, card_rect.y + 155))
         self.screen.blit(stats_surf, stats_rect)
 
         # Pulse restart hint
         hint_alpha = int(180 + 75 * math.sin(pygame.time.get_ticks() / 150.0))
         hint_surf = self.font_small.render("Press 'R' to Restart", True, (240, 240, 250))
         hint_surf.set_alpha(hint_alpha)
-        hint_rect = hint_surf.get_rect(center=(SCREEN_WIDTH / 2, card_rect.y + 195))
+        hint_rect = hint_surf.get_rect(center=(SCREEN_WIDTH / 2, card_rect.y + 225))
         self.screen.blit(hint_surf, hint_rect)
 
     def draw(self):
@@ -926,9 +972,9 @@ class CarRacingGame:
             # Keyboard fallback (agar sensor abhi connect nahi hua)
             keys = pygame.key.get_pressed()
             if keys[pygame.K_LEFT]:
-                keyboard_angle_override = -15.0
+                keyboard_angle_override = -20.0
             if keys[pygame.K_RIGHT]:
-                keyboard_angle_override = 15.0
+                keyboard_angle_override = 20.0
 
             self.update(dt, keyboard_angle_override)
             self.draw()
