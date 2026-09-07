@@ -1,39 +1,32 @@
 /*
   =====================================================================
-  ESP32 + Analog Joystick  ->  Web-Hosted "Tilt Plane" Game
+  ESP32 + MPU6050  ->  Tilt-Controlled "Web Plane Game"
   =====================================================================
 
   WHAT THIS DOES
   ---------------------------------------------------------------------
-  - ESP32 connects to your WiFi and hosts a web page (a canvas plane
-    game - same game as the MPU6050 version, but now controlled by a
-    standard 2-axis analog joystick module instead of a tilt sensor).
-  - Joystick X/Y (and the built-in push-button, if your module has one)
-    are read continuously and streamed to the browser over a WebSocket
-    (port 81).
-  - Push the joystick up/down to climb/dive your plane through gaps in
-    oncoming obstacles. Push the button (or click Start) to begin /
-    restart. Up/Down arrow keys also work, for testing without hardware.
+  - ESP32 connects to your WiFi and hosts a web page (a canvas plane game).
+  - MPU6050 is read continuously over I2C (no external MPU6050 library
+    needed - raw register access, so you only need two libraries).
+  - Tilt data is streamed to the browser over a WebSocket (port 81).
+  - You tilt the ESP32+MPU6050 board forward/back (pitch) to climb and
+    dive your plane through gaps in oncoming obstacles. Up/Down arrow
+    keys work too, for testing without hardware.
 
-  WIRING (typical KY-023 / PS2-style analog joystick module)
+  WIRING (ESP32 default I2C pins)
   ---------------------------------------------------------------------
-    Joystick       ESP32
+    MPU6050        ESP32
     -----------------------
     VCC     ->     3.3V
     GND     ->     GND
-    VRx     ->     GPIO 34   (ADC1_CH6, analog X axis)
-    VRy     ->     GPIO 35   (ADC1_CH7, analog Y axis)
-    SW      ->     GPIO 32   (digital push-button, active LOW,
-                              uses internal pull-up - optional)
-
-    NOTE: GPIO34/35 are input-only, ADC1 pins - perfect for analog
-    reads and don't clash with WiFi (which uses ADC2 internally).
+    SCL     ->     GPIO 22
+    SDA     ->     GPIO 21
 
   LIBRARIES TO INSTALL (Arduino IDE Library Manager)
   ---------------------------------------------------------------------
     1) "WebSockets" by Markus Sattler (Links2004/arduinoWebSockets)
-       -> used for the real-time joystick-data stream to the browser
-    (WiFi.h and WebServer.h are built into the ESP32 core already)
+       -> used for the real-time tilt-data stream to the browser
+    (Wire.h, WiFi.h, WebServer.h are built into the ESP32 core already)
 
   BOARD
   ---------------------------------------------------------------------
@@ -43,80 +36,106 @@
   ---------------------------------------------------------------------
     1) Fill in WIFI_SSID / WIFI_PASSWORD below.
     2) Upload the sketch, open Serial Monitor at 115200 baud.
-    3) Note the printed IP address. Keep the joystick centered/still
-       while it boots - it auto-calibrates the center position.
+    3) Note the printed IP address.
     4) On a phone/laptop on the same WiFi, open http://<that-ip>/
-    5) Push the joystick up/down to climb and dive your plane!
+    5) Tilt the ESP32 board left/right to steer the car!
   =====================================================================
 */
 
 #include <WiFi.h>
 #include <WebServer.h>
+#include <Wire.h>
 #include <WebSocketsServer.h>
 
 // ---------------------- USER CONFIG ---------------------------------
-const char *WIFI_SSID     = "YOUR_WIFI_SSID";
-const char *WIFI_PASSWORD = "YOUR_WIFI_PASSWORD";
+const char *WIFI_SSID     = "12";
+const char *WIFI_PASSWORD = "12345678";
 
-#define VRX_PIN 34
-#define VRY_PIN 35
-#define SW_PIN  32   // set to -1 if your joystick module has no button
+#define SDA_PIN 21
+#define SCL_PIN 22
+#define MPU_ADDR 0x68
 
 // ---------------------- GLOBALS ---------------------------------------
-WebServer        server(80);
+WebServer      server(80);
 WebSocketsServer webSocket(81);
 
-int centerX = 2048, centerY = 2048; // auto-calibrated at boot
-float joyX = 0, joyY = 0;           // normalized -1..1
-bool  buttonPressed = false;
+float accX, accY, accZ;      // g's
+float gyroX, gyroY, gyroZ;   // deg/s
+float gyroOffX = 0, gyroOffY = 0, gyroOffZ = 0;
 
 unsigned long lastSend = 0;
 const unsigned long SEND_INTERVAL_MS = 40; // ~25Hz stream to browser
 
 // ======================================================================
-//                          JOYSTICK READING
+//                          MPU6050 LOW-LEVEL I2C
 // ======================================================================
-void joystickInit() {
-  pinMode(VRX_PIN, INPUT);
-  pinMode(VRY_PIN, INPUT);
-  if (SW_PIN >= 0) pinMode(SW_PIN, INPUT_PULLUP);
-
-  analogReadResolution(12);          // 0-4095
-  analogSetAttenuation(ADC_11db);    // full 0-3.3V range
-
-  // Average a bunch of samples to find the resting center of the stick.
-  // Keep the joystick untouched while this runs.
-  long sx = 0, sy = 0;
-  const int N = 100;
-  for (int i = 0; i < N; i++) {
-    sx += analogRead(VRX_PIN);
-    sy += analogRead(VRY_PIN);
-    delay(3);
-  }
-  centerX = sx / N;
-  centerY = sy / N;
+void mpuWriteReg(uint8_t reg, uint8_t val) {
+  Wire.beginTransmission(MPU_ADDR);
+  Wire.write(reg);
+  Wire.write(val);
+  Wire.endTransmission();
 }
 
-void joystickRead() {
-  int rx = analogRead(VRX_PIN);
-  int ry = analogRead(VRY_PIN);
+bool mpuReadBytes(uint8_t reg, uint8_t *buf, uint8_t len) {
+  Wire.beginTransmission(MPU_ADDR);
+  Wire.write(reg);
+  if (Wire.endTransmission(false) != 0) return false;
+  Wire.requestFrom((int)MPU_ADDR, (int)len, (int)true);
+  for (uint8_t i = 0; i < len && Wire.available(); i++) {
+    buf[i] = Wire.read();
+  }
+  return true;
+}
 
-  // Normalize around the calibrated center to roughly -1..1.
-  float nx = (rx - centerX) / 2048.0;
-  float ny = (ry - centerY) / 2048.0;
+void mpuInit() {
+  Wire.begin(SDA_PIN, SCL_PIN);
+  Wire.setClock(400000);
 
-  if (nx > 1) nx = 1; if (nx < -1) nx = -1;
-  if (ny > 1) ny = 1; if (ny < -1) ny = -1;
+  mpuWriteReg(0x6B, 0x00); // PWR_MGMT_1: wake up (clear sleep bit)
+  delay(100);
+  mpuWriteReg(0x1C, 0x00); // ACCEL_CONFIG: +-2g
+  mpuWriteReg(0x1B, 0x00); // GYRO_CONFIG:  +-250 deg/s
+  delay(50);
+}
 
-  // small deadzone so the plane doesn't drift when the stick is "centered"
-  const float DEADZONE = 0.06;
-  if (fabs(nx) < DEADZONE) nx = 0;
-  if (fabs(ny) < DEADZONE) ny = 0;
+// quick startup calibration - keep the board still while this runs
+void mpuCalibrateGyro() {
+  const int N = 200;
+  long sx = 0, sy = 0, sz = 0;
+  uint8_t raw[14];
+  for (int i = 0; i < N; i++) {
+    if (mpuReadBytes(0x3B, raw, 14)) {
+      int16_t gx = (raw[8]  << 8) | raw[9];
+      int16_t gy = (raw[10] << 8) | raw[11];
+      int16_t gz = (raw[12] << 8) | raw[13];
+      sx += gx; sy += gy; sz += gz;
+    }
+    delay(3);
+  }
+  gyroOffX = (sx / (float)N) / 131.0;
+  gyroOffY = (sy / (float)N) / 131.0;
+  gyroOffZ = (sz / (float)N) / 131.0;
+}
 
-  joyX = nx;
-  joyY = ny;
+void mpuRead() {
+  uint8_t raw[14];
+  if (!mpuReadBytes(0x3B, raw, 14)) return;
 
-  buttonPressed = (SW_PIN >= 0) ? (digitalRead(SW_PIN) == LOW) : false;
+  int16_t axr = (raw[0]  << 8) | raw[1];
+  int16_t ayr = (raw[2]  << 8) | raw[3];
+  int16_t azr = (raw[4]  << 8) | raw[5];
+  // raw[6],raw[7] = temperature, unused
+  int16_t gxr = (raw[8]  << 8) | raw[9];
+  int16_t gyr = (raw[10] << 8) | raw[11];
+  int16_t gzr = (raw[12] << 8) | raw[13];
+
+  accX = axr / 16384.0;
+  accY = ayr / 16384.0;
+  accZ = azr / 16384.0;
+
+  gyroX = (gxr / 131.0) - gyroOffX;
+  gyroY = (gyr / 131.0) - gyroOffY;
+  gyroZ = (gzr / 131.0) - gyroOffZ;
 }
 
 // ======================================================================
@@ -140,7 +159,7 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
-<title>Joystick Plane - ESP32</title>
+<title>Tilt Plane - ESP32 MPU6050</title>
 <style>
   html,body{margin:0;padding:0;background:#111;color:#eee;font-family:sans-serif;overflow:hidden;height:100%;}
   #wrap{display:flex;flex-direction:column;align-items:center;justify-content:center;height:100%;}
@@ -161,18 +180,18 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
 <body>
 <div id="status" class="bad">connecting...</div>
 <div id="wrap">
-  <h2>Joystick Plane</h2>
+  <h2>Tilt Plane</h2>
   <div id="hud">
     <span>Score: <b id="score">0</b></span>
     <span>Speed: <b id="speed">0</b></span>
-    <span>Stick Y: <b id="joyval">0.0</b></span>
+    <span>Tilt: <b id="tiltval">0.0</b></span>
   </div>
   <div id="container">
     <canvas id="game" width="380" height="540"></canvas>
     <div id="overlay">
-      <h1 id="overlayTitle">Joystick Plane</h1>
-      <p>Push the joystick up/down to climb and dive through the gaps.<br>
-      Press the joystick button (or click Start) to play.<br>(Up/Down arrow keys also work for testing.)</p>
+      <h1 id="overlayTitle">Tilt Plane</h1>
+      <p>Tilt the ESP32 board forward/back (or left/right, depending on<br>
+      how you hold it) to climb and dive through the gaps.<br>(Up/Down arrow keys also work for testing.)</p>
       <button id="startBtn">Start Game</button>
     </div>
   </div>
@@ -186,37 +205,30 @@ const W = canvas.width, H = canvas.height;
 const statusEl = document.getElementById('status');
 const scoreEl = document.getElementById('score');
 const speedEl = document.getElementById('speed');
-const joyEl = document.getElementById('joyval');
+const tiltEl = document.getElementById('tiltval');
 const overlay = document.getElementById('overlay');
 const overlayTitle = document.getElementById('overlayTitle');
 const startBtn = document.getElementById('startBtn');
 
 // ---------------- WebSocket connection to ESP32 ----------------
-let stickY = 0;          // smoothed vertical input, roughly -1..1
-let rawJoyY = 0;
-let buttonDown = false;
-let prevButtonDown = false;
+let tiltY = 0;           // smoothed pitch input, roughly -1..1 (neg = climb, pos = dive)
+let rawAccY = 0;
 let wsConnected = false;
 
 function connectWS(){
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
   const ws = new WebSocket(proto + '://' + location.hostname + ':81/');
-  ws.onopen = () => { wsConnected = true; statusEl.textContent = 'Joystick connected'; statusEl.className='ok'; };
+  ws.onopen = () => { wsConnected = true; statusEl.textContent = 'MPU6050 connected'; statusEl.className='ok'; };
   ws.onclose = () => { wsConnected = false; statusEl.textContent = 'disconnected - retrying...'; statusEl.className='bad'; setTimeout(connectWS, 1500); };
   ws.onerror = () => { ws.close(); };
   ws.onmessage = (evt) => {
     try {
       const d = JSON.parse(evt.data);
-      rawJoyY = d.y;
-      let v = d.y * 1.3;              // sensitivity
+      // Steer using accelerometer Y (tilt forward/back = pitch). Clamp & scale.
+      rawAccY = d.ay;
+      let v = d.ay * 1.1;             // sensitivity (lower = gentler control)
       if (v > 1) v = 1; if (v < -1) v = -1;
-      stickY = stickY * 0.7 + v * 0.3; // smoothing (direct stick, less lag than tilt)
-
-      prevButtonDown = buttonDown;
-      buttonDown = !!d.btn;
-      if (buttonDown && !prevButtonDown && !running) {
-        startGame();
-      }
+      tiltY = tiltY * 0.85 + v * 0.15; // smoothing (higher = steadier flight)
     } catch(e) {}
   };
 }
@@ -249,14 +261,8 @@ function resetGame(){
   spawnTimer = 0;
 }
 
-function startGame(){
-  overlay.style.display = 'none';
-  overlayTitle.textContent = 'Joystick Plane';
-  resetGame();
-}
-
 function spawnObstacle(){
-  const gap = Math.max(210 - speed*2.5, 160);
+  const gap = Math.max(310 - speed*2.5, 160);
   const gapY = 40 + Math.random() * (H - 80 - gap);
   obstacles.push({
     x: W + 30,
@@ -270,14 +276,13 @@ function spawnObstacle(){
 function update(){
   if(!running) return;
 
-  // combine joystick input + keyboard fallback -> vertical velocity
-  // note: pushing joystick UP typically reads as negative Y -> plane climbs (negative = up on screen)
-  let pitch = stickY;
+  // combine tilt input + keyboard fallback -> vertical velocity
+  let pitch = tiltY;
   if (keyUp) pitch = -1;
   if (keyDown) pitch = 1;
 
-  const maxClimbSpeed = 4.4;
-  plane.vy = plane.vy * 0.78 + (pitch * maxClimbSpeed) * 0.22;
+  const maxClimbSpeed = 4.0;
+  plane.vy = plane.vy * 0.8 + (pitch * maxClimbSpeed) * 0.2;
   plane.y += plane.vy;
 
   if (plane.y < 0) { plane.y = 0; plane.vy = 0; }
@@ -322,7 +327,7 @@ function update(){
 
   scoreEl.textContent = Math.floor(score);
   speedEl.textContent = speed.toFixed(1);
-  joyEl.textContent = rawJoyY.toFixed(2);
+  tiltEl.textContent = rawAccY.toFixed(2);
 }
 
 function gameOver(){
@@ -339,6 +344,7 @@ function drawSky(){
   ctx.fillStyle = grad;
   ctx.fillRect(0,0,W,H);
 
+  // simple scrolling clouds
   ctx.fillStyle = 'rgba(255,255,255,0.08)';
   for (let i=0;i<5;i++){
     const cx = ((i*140) - (Date.now()/40 % 140) + W) % (W+140) - 70;
@@ -352,7 +358,9 @@ function drawSky(){
 function drawObstacles(){
   obstacles.forEach(o=>{
     ctx.fillStyle = '#6fcf97';
+    // top bar
     ctx.fillRect(o.x, 0, o.w, o.gapY);
+    // bottom bar
     ctx.fillRect(o.x, o.gapY + o.gapH, o.w, H - (o.gapY+o.gapH));
     ctx.fillStyle = 'rgba(0,0,0,0.2)';
     ctx.fillRect(o.x, o.gapY-8, o.w, 8);
@@ -374,6 +382,7 @@ function drawPlane(){
   ctx.translate(planeX + plane.w/2, plane.y + plane.h/2);
   ctx.rotate(plane.vy * 0.08);
 
+  // fuselage
   ctx.fillStyle = '#ecf0f1';
   ctx.beginPath();
   ctx.moveTo(-plane.w/2, 0);
@@ -383,6 +392,7 @@ function drawPlane(){
   ctx.closePath();
   ctx.fill();
 
+  // tail wing
   ctx.fillStyle = '#e74c3c';
   ctx.beginPath();
   ctx.moveTo(-plane.w/2, 0);
@@ -391,6 +401,7 @@ function drawPlane(){
   ctx.closePath();
   ctx.fill();
 
+  // main wing
   ctx.fillStyle = '#3498db';
   ctx.beginPath();
   ctx.moveTo(-4, -3);
@@ -407,6 +418,7 @@ function drawPlane(){
   ctx.closePath();
   ctx.fill();
 
+  // cockpit
   ctx.fillStyle = '#2c3e50';
   ctx.beginPath();
   ctx.arc(4, 0, 4, 0, Math.PI*2);
@@ -428,10 +440,14 @@ function loop(){
   requestAnimationFrame(loop);
 }
 
-startBtn.addEventListener('click', startGame);
+startBtn.addEventListener('click', () => {
+  overlay.style.display = 'none';
+  overlayTitle.textContent = 'Tilt Plane';
+  resetGame();
+});
 
 resetGame();
-running = false; // wait for Start button / joystick press
+running = false; // wait for Start button
 draw();
 requestAnimationFrame(loop);
 </script>
@@ -457,11 +473,12 @@ void setup() {
   Serial.begin(115200);
   delay(200);
   Serial.println();
-  Serial.println("Booting Joystick Plane server...");
+  Serial.println("Booting Tilt Car server...");
 
-  Serial.println("Calibrating joystick center - keep it untouched...");
-  joystickInit();
-  Serial.printf("Calibration done. Center = (%d, %d)\n", centerX, centerY);
+  mpuInit();
+  Serial.println("Calibrating gyro - keep the board still...");
+  mpuCalibrateGyro();
+  Serial.println("Calibration done.");
 
   WiFi.mode(WIFI_STA);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
@@ -490,15 +507,15 @@ void loop() {
   server.handleClient();
   webSocket.loop();
 
-  joystickRead();
+  mpuRead();
 
   unsigned long now = millis();
   if (now - lastSend >= SEND_INTERVAL_MS) {
     lastSend = now;
-    char json[96];
+    char json[160];
     snprintf(json, sizeof(json),
-      "{\"x\":%.3f,\"y\":%.3f,\"btn\":%d}",
-      joyX, joyY, buttonPressed ? 1 : 0);
+      "{\"ax\":%.3f,\"ay\":%.3f,\"az\":%.3f,\"gx\":%.2f,\"gy\":%.2f,\"gz\":%.2f}",
+      accX, accY, accZ, gyroX, gyroY, gyroZ);
     webSocket.broadcastTXT(json);
   }
 }
